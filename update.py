@@ -1,127 +1,221 @@
 #!/usr/bin/env python3
-"""World Pulse: public RSS + optional Reddit public JSON, no API keys.
-Summaries are extractive headline digests, not fabricated AI reporting.
+"""WORLD PULSE: free Traditional-Chinese-first news, source-grounded summaries.
+No paid APIs. Does not fabricate missing article text or promise translation.
 """
-import datetime as dt, email.utils, html, json, os, re, time, urllib.parse, urllib.request, xml.etree.ElementTree as ET
-from collections import defaultdict
+import datetime as dt
+import email.utils
+import html
+import json
+import re
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
-ROOT=Path(__file__).resolve().parent
-OUT=ROOT/'data'/'pulse.json'
-NOW=dt.datetime.now(dt.timezone.utc)
-HEADERS={'User-Agent':'WorldPulse/2.0 (+public informational dashboard; contact via repository)', 'Accept':'application/rss+xml, application/xml, application/json, text/xml'}
-REGIONS={'全球':('WORLD','zh-HK','HK','HK:zh-Hant'),'香港':('HK','zh-HK','HK','HK:zh-Hant'),'美國':('US','en-US','US','US:en'),'英國':('GB','en-GB','GB','GB:en'),'台灣':('TW','zh-TW','TW','TW:zh-Hant'),'中國':('CN','zh-CN','CN','CN:zh-Hans'),'日本':('JP','ja','JP','JP:ja'),'韓國':('KR','ko','KR','KR:ko'),'新加坡':('SG','en-SG','SG','SG:en'),'澳洲':('AU','en-AU','AU','AU:en')}
-TOPICS={'科技 AI':'AI technology','財經':'global economy stocks','國際政治':'world politics','娛樂':'entertainment culture'}
+ROOT = Path(__file__).resolve().parent
+OUT = ROOT / 'data' / 'pulse.json'
+NOW = dt.datetime.now(dt.timezone.utc)
+HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; WorldPulse/3.0; public RSS reader)', 'Accept': 'application/rss+xml, application/xml, application/json, text/xml'}
+REGIONS = {
+    '全球': '國際 世界', '香港': '香港', '美國': '美國', '英國': '英國',
+    '台灣': '台灣', '中國': '中國', '日本': '日本', '韓國': '韓國',
+    '新加坡': '新加坡', '澳洲': '澳洲',
+}
+TOPICS = {'科技 AI': '人工智能 科技', '財經': '經濟 股市', '國際政治': '國際 政治', '娛樂': '娛樂 文化'}
+SPORTS = re.compile(
+    r'體育|運動賽事|足球|籃球|棒球|網球|羽毛球|乒乓球|高爾夫|賽馬|奧運|世界盃|世界杯|歐聯|英超|西甲|德甲|意甲|法甲|NBA|NFL|MLB|NHL|FIFA|UEFA|Premier League|Champions League|World Cup|Olympics|Grand Slam|Formula 1|F1|sports? scores?|playoffs?|touchdown|quarterback|goalkeeper',
+    re.I,
+)
+SPORTS_EXTRA = re.compile(r'(?i)\b(?:soccer|football|basketball|baseball|tennis|cricket|rugby|badminton|athletics|wimbledon|super bowl|match highlights|live score|ufc|boxing|f1|formula one|motogp)\b|サッカー|野球|バスケ|テニス|スポーツ|축구|야구|농구|스포츠|運動員|球隊|賽事|聯賽|決賽|冠軍賽')
+def is_sports(text):
+    return bool(SPORTS.search(text or '') or SPORTS_EXTRA.search(text or ''))
 
-def fetch(url, timeout=14):
-    req=urllib.request.Request(url,headers=HEADERS)
-    with urllib.request.urlopen(req,timeout=timeout) as resp:
+
+def fetch(url, timeout=18):
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read(1_500_000)
 
-def clean(s):
-    s=re.sub(r'<[^>]*>',' ',s or '')
-    return re.sub(r'\s+',' ',html.unescape(s)).strip()[:500]
+def clean(value):
+    value = re.sub(r'<[^>]*>', ' ', value or '')
+    return re.sub(r'\s+', ' ', html.unescape(value)).strip()[:1200]
 
-def when(s):
+def when(value):
     try:
-        v=email.utils.parsedate_to_datetime(s)
-        return v.astimezone(dt.timezone.utc).isoformat() if v else None
-    except (TypeError,ValueError,OverflowError):return None
+        parsed = email.utils.parsedate_to_datetime(value)
+        return parsed.astimezone(dt.timezone.utc).isoformat() if parsed else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+def chinese_count(value):
+    return len(re.findall(r'[\u3400-\u9fff]', value))
+
+TRANSLATION_LIMIT = 45
+_translation_calls = 0
+
+def to_zh(text):
+    """Best-effort free public endpoint. May be blocked/rate limited; keep original then."""
+    global _translation_calls
+    text = clean(text)
+    if not text or chinese_count(text) >= 5 or _translation_calls >= TRANSLATION_LIMIT:
+        return text, False
+    if not re.search(r'[A-Za-z\u3040-\u30ff\uac00-\ud7af]', text):
+        return text, False
+    _translation_calls += 1
+    try:
+        params = urllib.parse.urlencode({'client':'gtx','sl':'auto','tl':'zh-TW','dt':'t','q':text})
+        data = json.loads(fetch('https://translate.googleapis.com/translate_a/single?' + params, timeout=7))
+        translated = clean(''.join(row[0] for row in data[0] if row and row[0]))
+        if translated and translated.casefold() != text.casefold():
+            return translated, True
+    except Exception:
+        pass
+    return text, False
+
+def summary_from_description(title, description):
+    """Only use source-provided RSS description; never pad with invented claims."""
+    description = clean(description)
+    description = re.sub(r'\s*(?:閱讀更多|Read more|Continue reading)\s*$', '', description, flags=re.I)
+    if not description or description.casefold() == title.casefold():
+        return '', 'insufficient_source'
+    if description.startswith(title):
+        description = description[len(title):].lstrip(' ：:—-')
+    if chinese_count(description) < 45:
+        return '', 'insufficient_source'
+    result = description[:100].rstrip('，、；：,;: ')
+    if chinese_count(result) < 45:
+        return '', 'insufficient_source'
+    return result, 'rss_description'
 
 def parse_rss(raw, source):
-    root=ET.fromstring(raw)
-    items=[]
-    for x in root.findall('.//item')[:24]:
-        def field(k):
-            el=x.find(k)
-            return (el.text or '').strip() if el is not None else ''
-        title=clean(field('title'))
-        url=field('link')
-        if not title or not url.startswith('http'):continue
-        src=x.find('source')
-        publisher=clean(src.text) if src is not None and src.text else source
-        # RSS descriptions often repeat title or include syndicated markup; do not claim full-article summary.
-        desc=clean(field('description'))
-        if title.lower() in desc.lower() or len(desc)<50:desc=''
-        items.append({'title':title,'url':url,'publisher':publisher,'published':when(field('pubDate')),'excerpt':desc[:220], 'source_type':'rss'})
-    return items
+    root = ET.fromstring(raw)
+    output = []
+    seen = set()
+    for item in root.findall('.//item')[:45]:
+        title = clean(item.findtext('title') or '')
+        url = (item.findtext('link') or '').strip()
+        if not title or not url.startswith('http') or is_sports(title):
+            continue
+        if title.casefold() in seen:
+            continue
+        seen.add(title.casefold())
+        source_el = item.find('source')
+        publisher = clean(source_el.text) if source_el is not None and source_el.text else source
+        description = clean(item.findtext('description') or '')
+        summary, summary_type = summary_from_description(title, description)
+        title_zh, title_translated = to_zh(title)
+        if summary:
+            summary_zh, summary_translated = to_zh(summary)
+        else:
+            summary_zh, summary_translated = '', False
+        output.append({
+            'title': title_zh, 'original_title': title if title_translated else '', 'translated': title_translated, 'url': url, 'publisher': publisher,
+            'published': when(item.findtext('pubDate') or ''),
+            'excerpt': summary_zh or '原始新聞來源未提供足夠內容，暫時無法可靠整理 50–100 字摘要。請查看原文。',
+            'summary_type': summary_type, 'summary_translated': summary_translated, 'source_type': 'rss',
+        })
+    return output
 
-def google_news(region, topic=None):
-    code,hl,gl,ceid=REGIONS[region]
-    base='https://news.google.com/rss/'
-    if topic:
-        query=urllib.parse.quote(topic+' when:2d')
-        base+='search?q='+query+'&'
-    else:base+='headlines?'
-    return base+urllib.parse.urlencode({'hl':hl,'gl':gl,'ceid':ceid})
+def news_url(query):
+    # Google News Chinese-language search, not a guaranteed machine translation.
+    q = query + ' when:2d -足球 -籃球 -體育 -NBA -英超 -奧運'
+    return 'https://news.google.com/rss/search?' + urllib.parse.urlencode({
+        'q': q, 'hl': 'zh-HK', 'gl': 'HK', 'ceid': 'HK:zh-Hant',
+    })
 
-def trends_feed(region):
-    geo={'香港':'HK','美國':'US','英國':'GB','台灣':'TW','日本':'JP','澳洲':'AU'}.get(region,'US')
-    return 'https://trends.google.com/trending/rss?geo='+geo
+def trends_url(region):
+    geo = {'香港':'HK','美國':'US','英國':'GB','台灣':'TW','日本':'JP','澳洲':'AU','韓國':'KR'}.get(region,'US')
+    return 'https://trends.google.com/trending/rss?geo=' + geo
+
+def traffic_value(raw):
+    raw = (raw or '').replace(',', '').strip().upper()
+    m = re.search(r'(\d+(?:\.\d+)?)\s*([KMB]?)', raw)
+    if not m:
+        return 0
+    return int(float(m.group(1)) * {'':1,'K':1000,'M':1000000,'B':1000000000}[m.group(2)])
 
 def parse_trends(raw, region):
-    root=ET.fromstring(raw)
-    out=[]
-    for item in root.findall('.//item')[:12]:
-        title=clean(item.findtext('title') or '')
-        url=(item.findtext('link') or '').strip()
-        if not title:continue
-        # Related news items, if present, are verifiable context, not evidence of a specific social-platform ranking.
-        news=[]
+    root = ET.fromstring(raw)
+    output, seen = [], set()
+    for item in root.findall('.//item'):
+        title = clean(item.findtext('title') or '')
+        if not title or is_sports(title) or len(title) > 100:
+            continue
+        key = re.sub(r'\W+', '', title).casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        context = []
+        traffic = ''
         for el in item.iter():
-            if el.tag.endswith('news_item'):
-                values={child.tag.split('}')[-1]:clean(child.text or '') for child in el}
-                if values.get('news_item_title'):
-                    news.append({'title':values['news_item_title'],'source':values.get('news_item_source',''), 'url':values.get('news_item_url','')})
-        if not url.startswith('https://'):
-            url='https://trends.google.com/trending?geo='+urllib.parse.quote({'香港':'HK','美國':'US','英國':'GB','台灣':'TW','日本':'JP','澳洲':'AU'}.get(region,'US'))
-        out.append({'topic':title,'region':region,'platform':'Google Trends','url':url,'context':news[:3], 'summary':('相關報道：'+'；'.join(n['title'] for n in news[:2])) if news else '此話題出現在 Google Trends；暫未取得足夠內容作可靠摘要。', 'summary_type':'related_headlines' if news else 'unavailable'})
-    return out
-
-def reddit():
-    # Reddit may deny automated access; optional source only.
-    url='https://www.reddit.com/r/worldnews/hot.json?limit=12&raw_json=1'
-    raw=fetch(url)
-    entries=json.loads(raw).get('data',{}).get('children',[])
-    out=[]
-    for row in entries:
-        d=row.get('data',{})
-        if d.get('stickied') or d.get('over_18'):continue
-        title=clean(d.get('title',''))
-        path=d.get('permalink','')
-        if title and path.startswith('/r/'):
-            out.append({'topic':title,'region':'全球','platform':'Reddit r/worldnews','url':'https://www.reddit.com'+path,'context':[],'summary':'Reddit 熱門討論帖標題；未取得留言內容，不能可靠概括網民意見。','summary_type':'headline_only'})
-    return out[:8]
+            tag = el.tag.split('}')[-1]
+            if tag == 'approx_traffic':
+                traffic = clean(el.text or '')
+            if tag == 'news_item':
+                data = {c.tag.split('}')[-1]: clean(c.text or '') for c in el}
+                headline = data.get('news_item_title', '')
+                if headline and not is_sports(headline):
+                    context.append({'title': headline, 'source': data.get('news_item_source',''), 'url': data.get('news_item_url','')})
+        # Skip sports trends even if ambiguous title is a player/team name but context identifies sports.
+        all_context = [clean(c.text or '') for el in item.iter() if el.tag.split('}')[-1]=='news_item' for c in el if c.tag.split('}')[-1]=='news_item_title']
+        if all_context and sum(is_sports(t) for t in all_context) >= max(1, len(all_context)//2 + 1):
+            continue
+        translated, translated_ok = to_zh(title)
+        geo = {'香港':'HK','台灣':'TW','日本':'JP','韓國':'KR','美國':'US'}.get(region,'US')
+        output.append({'topic': translated, 'original_topic': title if translated_ok else '', 'region':region,
+            'platform':'Google Trends','url':'https://trends.google.com/trending?geo='+geo,
+            'traffic':traffic,'traffic_value':traffic_value(traffic),'context':context[:2],
+            'summary':'相關報道：'+'；'.join(x['title'] for x in context[:2]) if context else 'Google Trends 搜尋量上升；未取得足夠可靠資料解釋原因。',
+            'summary_type':'related_headlines' if context else 'unavailable'})
+    # RSS is already a trending list; use estimated search volume as a secondary ordering signal.
+    output.sort(key=lambda x:x['traffic_value'], reverse=True)
+    return output[:10]
 
 def main():
-    report={'generated_at':NOW.isoformat(),'method':'公開 RSS 標題與相關報道整理；非生成式 AI 摘要，未讀取新聞全文。','regions':{},'topics':{},'trends':[],'errors':[]}
-    count=0
-    for region in REGIONS:
+    report = {'generated_at':NOW.isoformat(),
+        'method':'繁體中文來源優先；非中文內容嘗試免費翻譯（不保證成功）；只按 RSS 內容提供摘要；體育關鍵字過濾；全球榜為地區選集，非全球精確排名。',
+        'regions':{},'topics':{},'trends':[],'errors':[]}
+    total = 0
+    for region, query in REGIONS.items():
         try:
-            items=parse_rss(fetch(google_news(region)), 'Google News RSS')
-            report['regions'][region]=items[:12]
-            count+=len(items)
-            print(region,len(items))
-        except Exception as e:
-            report['regions'][region]=[]
-            report['errors'].append(f'{region} 新聞暫不可用：{type(e).__name__}')
-        time.sleep(.12)
-    for topic,q in TOPICS.items():
-        try:report['topics'][topic]=parse_rss(fetch(google_news('香港',q)),'Google News RSS')[:10]
-        except Exception as e:
-            report['topics'][topic]=[]
-            report['errors'].append(f'{topic} 專題暫不可用：{type(e).__name__}')
-    for region in ['香港','台灣','美國','英國','日本']:
-        try:report['trends']+=parse_trends(fetch(trends_feed(region)),region)
-        except Exception as e:report['errors'].append(f'{region} Google Trends 暫不可用：{type(e).__name__}')
-    try:report['trends']+=reddit()
-    except Exception as e:report['errors'].append(f'Reddit 暫不可用：{type(e).__name__}')
-    # Only publish fresh content, never silently preserve stale records as current.
-    report['status']='ok' if count else 'unavailable'
-    OUT.parent.mkdir(exist_ok=True)
-    tmp=OUT.with_suffix('.tmp')
-    tmp.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-    tmp.replace(OUT)
-    print('News items:',count,'trends:',len(report['trends']),'errors:',report['errors'])
+            articles = parse_rss(fetch(news_url(query)), 'Google News RSS')[:12]
+            report['regions'][region] = articles
+            total += len(articles)
+            print(region, len(articles))
+        except Exception as exc:
+            report['regions'][region] = []
+            report['errors'].append(f'{region} 新聞暫不可用：{type(exc).__name__}')
+        time.sleep(.15)
+    for topic, query in TOPICS.items():
+        try:
+            report['topics'][topic] = parse_rss(fetch(news_url(query)), 'Google News RSS')[:10]
+        except Exception as exc:
+            report['topics'][topic] = []
+            report['errors'].append(f'{topic} 專題暫不可用：{type(exc).__name__}')
+    for region in ['香港','台灣','日本','韓國','美國']:
+        try:
+            report['trends'].extend(parse_trends(fetch(trends_url(region)),region))
+        except Exception as exc:
+            report['errors'].append(f'{region} Google Trends 暫不可用：{type(exc).__name__}')
+    # Global is a cross-region selection, NOT a measured worldwide ranking.
+    by_region = {r:[t for t in report['trends'] if t['region']==r] for r in ['香港','台灣','日本','韓國','美國']}
+    global_items, global_seen = [], set()
+    for i in range(10):
+        for r in by_region:
+            if i < len(by_region[r]):
+                item = by_region[r][i]
+                key = re.sub(r'\W+', '', item['topic']).casefold()
+                if key not in global_seen:
+                    global_seen.add(key)
+                    global_items.append(dict(item, region='全球', origin_region=r))
+    report['trends'].extend(global_items[:10])
+    report['status'] = 'ok' if total else 'unavailable'
+    OUT.parent.mkdir(parents=True,exist_ok=True)
+    temp = OUT.with_suffix('.tmp')
+    temp.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+    temp.replace(OUT)
+    print('News items:',total,'trends:',len(report['trends']),'errors:',report['errors'])
 
-if __name__=='__main__':main()
+if __name__ == '__main__':
+    main()
