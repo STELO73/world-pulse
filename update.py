@@ -6,7 +6,7 @@ import datetime as dt, email.utils, html, json, os, re, time, urllib.parse, urll
 from collections import defaultdict
 from pathlib import Path
 
-ROOT=Path(__file__).resolve().parents[1]
+ROOT=Path(__file__).resolve().parents
 OUT=ROOT/'data'/'pulse.json'
 NOW=dt.datetime.now(dt.timezone.utc)
 HEADERS={'User-Agent':'WorldPulse/2.0 (+public informational dashboard; contact via repository)', 'Accept':'application/rss+xml, application/xml, application/json, text/xml'}
